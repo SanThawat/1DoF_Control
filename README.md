@@ -35,7 +35,7 @@ S-Curve Trajectory Generator ทำหน้าที่สร้าง **refere
 | ความซับซ้อน | ต่ำ | สูงกว่า |
 
 ### 7-Phase Model
-
+![Block Diagram](electronics-08-00652-g001.png)
 ```
 Phase 1 : jerk = +J_max  →  accel เพิ่มขึ้น
 Phase 2 : jerk =  0      →  accel คงที่ที่ A_max
