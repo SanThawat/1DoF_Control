@@ -1,345 +1,217 @@
-# 1DoF_Control
-# S-Curve Trajectory Generator
+# 🦾 Robot Arm 1-DOF — STM32 NUCLEO-G474RE
 
-Library สำหรับสร้าง jerk-limited motion profile แบบ 7-phase บน STM32 NUCLEO-G474RE
-ออกแบบมาเพื่อใช้งานร่วมกับ cascade control loop สำหรับหุ่นยนต์แขน 1 DOF
-
----
-
-## สารบัญ
-
-- [ภาพรวม](#ภาพรวม)
-- [ไฟล์ที่เกี่ยวข้อง](#ไฟล์ที่เกี่ยวข้อง)
-- [การตั้งค่า](#การตั้งค่า)
-- [โครงสร้างข้อมูล](#โครงสร้างข้อมูล)
-- [API Reference](#api-reference)
-- [การใช้งานกับ Cascade Control](#การใช้งานกับ-cascade-control)
-- [การใช้งาน Waypoints](#การใช้งาน-waypoints)
-- [สิ่งที่ต้องระวัง](#สิ่งที่ต้องระวัง)
-- [Checklist ก่อน Deploy](#checklist-ก่อน-deploy)
+ระบบควบคุมแขนกล 1 แกนหมุน (1-DOF) ด้วย Brush DC Motor 24V บน STM32G474RE  
+ใช้ S-Curve Trajectory + Cascade PID (position → velocity) + Kalman Filter 4-state  
+ควบคุมที่ความถี่ **1 kHz** ผ่าน TIM7 ISR
 
 ---
 
-## ภาพรวม
+## Hardware
 
-S-Curve Trajectory Generator ทำหน้าที่สร้าง **reference signal** ที่มี jerk จำกัด
-โดย output ที่ได้ในแต่ละ timestep ประกอบด้วย position, velocity, และ acceleration
-ซึ่งนำไปใช้เป็น setpoint และ feedforward ในแต่ละชั้นของ cascade control ได้โดยตรง
-
-### ทำไมต้องใช้ S-Curve?
-
-| คุณสมบัติ | Trapezoidal | S-Curve |
-|---|---|---|
-| Jerk | ไม่จำกัด (กระตุก) | จำกัด (นุ่มนวล) |
-| การสั่นสะเทือน | มาก | น้อย |
-| ความซับซ้อน | ต่ำ | สูงกว่า |
-
-### 7-Phase Model
-![Block Diagram](electronics-08-00652-g001.png)
-```
-Phase 1 : jerk = +J_max  →  accel เพิ่มขึ้น
-Phase 2 : jerk =  0      →  accel คงที่ที่ A_max
-Phase 3 : jerk = -J_max  →  accel ลดลงเป็น 0
-Phase 4 : accel = 0      →  velocity คงที่ (cruise)
-Phase 5 : jerk = -J_max  →  เริ่มเบรก, accel ลงติดลบ
-Phase 6 : jerk =  0      →  accel คงที่ที่ -A_max
-Phase 7 : jerk = +J_max  →  accel กลับขึ้นมาเป็น 0
-```
-
-Phase 5–7 สมมาตรกับ Phase 3–1 พอดี
-
----
-
-## ไฟล์ที่เกี่ยวข้อง
-
-```
-scurve_trajectory.h   ←  type definitions, constants, function prototypes
-scurve_trajectory.c   ←  implementation (ไฟล์นี้)
-```
-
-Include ในโปรเจกต์:
-
-```c
-#include "scurve_trajectory.h"
-```
-
----
-
-## การตั้งค่า
-
-แก้ค่าใน `scurve_trajectory.h` ให้เหมาะกับ motor จริงก่อนใช้งาน:
-
-```c
-#define SCURVE_V_MAX_DEG_S      // ความเร็วสูงสุด [deg/s]
-#define SCURVE_A_MAX_DEG_S2     // acceleration สูงสุด [deg/s²]
-#define SCURVE_J_MAX_DEG_S3     // jerk สูงสุด [deg/s³]
-#define TRAJ_DT                 // control loop period [s]  เช่น 0.001f = 1 kHz
-#define WAYPOINT_COUNT          // จำนวน waypoints
-```
-
-> **สำคัญ:** ตั้งค่าทั้ง 3 limits ให้ไม่เกิน spec ของ motor และ drive จริง
-> และ `TRAJ_DT` ต้องตรงกับ interrupt period จริงของระบบ
-
----
-
-## โครงสร้างข้อมูล
-
-### `SCurveTraj_t`
-
-State machine หลักของ trajectory ประกาศ **1 ตัวต่อ 1 แกน**
-
-```c
-SCurveTraj_t traj;
-```
-
-### `TrajOutput_t`
-
-Output ที่ได้จาก `SCurve_Update()` ในแต่ละ timestep
-
-```c
-typedef struct {
-    float position_deg;     // position reference  [deg]
-    float velocity_deg_s;   // velocity reference  [deg/s]
-    float accel_deg_s2;     // acceleration reference [deg/s²]
-} TrajOutput_t;
-```
-
----
-
-## API Reference
-
-### `SCurve_Init()`
-
-```c
-void SCurve_Init(SCurveTraj_t *traj);
-```
-
-Initialize state machine รีเซ็ตทุก field เป็น 0 และตั้ง state เป็น `TRAJ_IDLE`
-
-> เรียกครั้งเดียวตอน startup หรือหลัง reset เท่านั้น
-
----
-
-### `SCurve_SetSegment()`
-
-```c
-void SCurve_SetSegment(SCurveTraj_t *traj, float q_start, float q_end);
-```
-
-กำหนด point-to-point segment ใหม่ ระบบจะคำนวณระยะเวลาแต่ละ phase อัตโนมัติ
-รวมถึงจัดการ short move (ระยะสั้น) ด้วย bisection search
-
-| Parameter | คำอธิบาย |
+| ชิ้นส่วน | รายละเอียด |
 |---|---|
-| `traj` | pointer ไปยัง state machine |
-| `q_start` | ตำแหน่งเริ่มต้น [deg] — ควรอ่านจาก encoder จริง |
-| `q_end` | ตำแหน่งเป้าหมาย [deg] |
+| MCU | STM32 NUCLEO-G474RE (170 MHz) |
+| Motor | Brush DC 24 V |
+| Motor Driver | Cyton MD20A (DIR + PWM) |
+| Encoder | Quadrature, 8192 counts/rev (X4 mode) |
+| Power Supply | 24 V |
 
----
+### การเชื่อมต่อขา
 
-### `SCurve_Update()`
-
-```c
-TrajOutput_t SCurve_Update(SCurveTraj_t *traj);
-```
-
-คำนวณ reference ณ timestep ปัจจุบัน **ต้องเรียกทุก `TRAJ_DT` วินาที** ด้วยความถี่คงที่
-
-คืนค่า `TrajOutput_t` ที่มี position, velocity, acceleration reference
-
----
-
-### `SCurve_IsDone()`
-
-```c
-bool SCurve_IsDone(const SCurveTraj_t *traj);
-```
-
-คืนค่า `true` เมื่อ trajectory เสร็จสิ้น (`TRAJ_DONE`) หรือยังไม่เริ่ม (`TRAJ_IDLE`)
-
----
-
-### `SCurve_RunWaypoints()`
-
-```c
-TrajOutput_t SCurve_RunWaypoints(SCurveTraj_t *traj, float current_pos);
-```
-
-เรียกใช้ waypoint list อัตโนมัติ เมื่อ segment หนึ่งเสร็จจะขยับไป waypoint ถัดไปเอง
-แทน `SCurve_Update()` ได้เลยในกรณีที่ใช้ waypoints
-
----
-
-## การใช้งานกับ Cascade Control
-
-### ขั้นตอนพื้นฐาน
-
-```c
-// 1. Init (ทำครั้งเดียว)
-SCurveTraj_t traj;
-SCurve_Init(&traj);
-
-// 2. กำหนด segment (อ่านตำแหน่งจริงจาก encoder เสมอ)
-SCurve_SetSegment(&traj, encoder_read_deg(), 180.0f);
-
-// 3. เรียกใน control loop ทุก TRAJ_DT
-TrajOutput_t ref = SCurve_Update(&traj);
-
-// 4. ส่ง reference ไปยัง controller
-// ref.position_deg   → setpoint ของ outer loop
-// ref.velocity_deg_s → velocity feedforward
-// ref.accel_deg_s2   → acceleration feedforward
-
-// 5. ตรวจสิ้นสุด
-if (SCurve_IsDone(&traj)) {
-    // เริ่ม segment ใหม่หรือหยุด
-}
-```
-
----
-
-### Cascade 2 ชั้น (Position + Velocity)
-
-เหมาะสำหรับ DC motor หรือ stepper ทั่วไป
-
-```
-ref.position_deg ──→ [+]──→ [ Position PID ] ──→ vel_setpoint
-          actual_pos ──→[−]↗
-                                   ↓
-              ref.velocity_deg_s ─(+) ← velocity feedforward
-                                   ↓
-                        [+]──→ [ Velocity PID ] ──→ pwm / torque
-              actual_vel ──→[−]↗
-                                   ↑
-              ref.accel_deg_s2 ──(Kff)
-```
-
-```c
-TrajOutput_t ref = SCurve_Update(&traj);
-
-// Outer loop: position
-float pos_error    = ref.position_deg - encoder_get_deg();
-float vel_setpoint = pid_update(&pos_pid, pos_error)
-                   + ref.velocity_deg_s;        // velocity feedforward
-
-// Inner loop: velocity
-float vel_error = vel_setpoint - encoder_get_vel_deg_s();
-float output    = pid_update(&vel_pid, vel_error)
-                + Kff_accel * ref.accel_deg_s2; // accel feedforward
-
-motor_set_pwm(output);
-```
-
----
-
-### Cascade 3 ชั้น (Position + Velocity + Current)
-
-เหมาะสำหรับ BLDC หรือ servo drive ที่ควบคุม torque ได้
-
-```
-ref.position_deg  ──→ [ Position P   ] ──→ vel_cmd
-ref.velocity_deg_s──→ (feedforward)  ──↗
-                                          ↓
-                       [ Velocity PI  ] ──→ iq_cmd
-ref.accel_deg_s2  ──→ (J/Kt × accel) ──↗
-                                          ↓
-                       [ Current PI   ] ──→ PWM / SVPWM
-```
-
-```c
-TrajOutput_t ref = SCurve_Update(&traj);
-
-// Loop 1: position (ใช้ P controller เพราะมี vel feedforward)
-float vel_cmd = Kp_pos * (ref.position_deg - encoder_get_deg())
-              + ref.velocity_deg_s;
-
-// Loop 2: velocity (+ inertia feedforward)
-float iq_cmd = Kp_vel * (vel_cmd - encoder_get_vel_deg_s())
-             + Ki_vel * vel_integrator
-             + (J_motor / Kt) * ref.accel_deg_s2;
-
-// Loop 3: current (ทำใน inner ISR)
-float pwm = current_controller_update(iq_cmd, adc_read_current());
-```
-
----
-
-### การใช้ Feedforward อย่างถูกต้อง
-
-| Signal | ใช้เป็น | ประโยชน์ |
+| สัญญาณ | Pin | Timer/Peripheral |
 |---|---|---|
-| `position_deg` | setpoint ของ outer loop | error term หลัก |
-| `velocity_deg_s` | velocity feedforward | ลด lag ของ position loop |
-| `accel_deg_s2` | inertia feedforward | ลด tracking error ช่วงเร่ง/เบรก |
-
-**แนวทาง tune feedforward gain:**
-- เริ่มที่ `Kff_vel = 1.0` แล้วปรับลงถ้าเกิด overshoot
-- `Kff_accel = J_total / Kt` โดย `J_total` คือ inertia รวมของแขน + motor
-
----
-
-## การใช้งาน Waypoints
-
-กำหนด waypoints ใน `scurve_trajectory.c`:
-
-```c
-const float WAYPOINTS_DEG[WAYPOINT_COUNT] = {90.0f, 180.0f, 360.0f, 180.0f, 270.0f};
-```
-
-ใช้งานใน control loop แทน `SCurve_Update()`:
-
-```c
-TrajOutput_t ref = SCurve_RunWaypoints(&traj, encoder_get_deg());
-
-// ส่งไปยัง controller เหมือนเดิม
-pos_controller_setpoint(ref.position_deg);
-vel_feedforward(ref.velocity_deg_s);
-accel_feedforward(ref.accel_deg_s2);
-```
-
-> ถ้าต้องการเปลี่ยน waypoints แบบ dynamic ให้ refactor `WAYPOINTS_DEG` เป็น pointer array
-> และเพิ่ม setter function เพื่อความปลอดภัย
+| PWM Output | TIM1 CH1 | PA8 |
+| Motor DIR | PB4 | GPIO Output |
+| Encoder A/B | TIM2 CH1/CH2 | PA0, PA1 |
+| Control ISR | TIM7 | 1 kHz interrupt |
+| UART Log | LPUART1 | PA2 (TX), PA3 (RX) |
+| User Button | PC13 (B1) | EXTI interrupt |
 
 ---
 
-## สิ่งที่ต้องระวัง
+## Software Architecture
 
-**Timing drift** — `TRAJ_DT` ต้องตรงกับ period จริงของ loop ถ้า jitter มาก trajectory จะ drift
-เพราะ generator ใช้เวลาสะสม ไม่ใช่ absolute timestamp แนะนำให้เรียก `SCurve_Update()`
-ใน hardware timer ISR หรือ RTOS task ที่มี period แน่นอน
-
-**Unit consistency** — ทุกค่าใช้หน่วย degree ถ้า controller ใช้ radian ต้องแปลงก่อน:
-
-```c
-float pos_rad = ref.position_deg * (M_PI / 180.0f);
-float vel_rad = ref.velocity_deg_s * (M_PI / 180.0f);
-float acc_rad = ref.accel_deg_s2  * (M_PI / 180.0f);
+```
+Waypoints [deg]
+     │
+     ▼
+┌─────────────────────────┐
+│   S-Curve Generator     │  ← 7-phase trajectory, pure kinematic
+│   pos_ref / vel_ref     │    ไม่มี Euler integration → ไม่มี drift
+└────────────┬────────────┘
+             │ pos_ref, vel_ref
+             ▼
+┌─────────────────────────┐
+│   Outer PID (Position)  │  ← output = vel_cmd [deg/s]
+│   Zone switch ≤10 deg   │    fine-zone gain switching ใกล้เป้า
+└────────────┬────────────┘
+             │ vel_setpoint
+             ▼
+┌─────────────────────────┐
+│   Inner PID (Velocity)  │  ← output = pwm_pid
+│ + Velocity Feedforward  │    FF = (KE·ω + B·ω) / eff
+└────────────┬────────────┘
+             │ pwm_cmd
+             ▼
+┌─────────────────────────┐
+│   Motor Driver MD20A    │  ← DIR pin + TIM1 PWM compare
+│   Brush DC 24 V         │
+└────────────┬────────────┘
+             │ encoder counts
+             ▼
+┌─────────────────────────┐
+│   Kalman Filter 4-state │  ← [θ, ω, i, τ_disturbance]
+│   Predict + Update      │    Exact discretization (Van Loan's)
+└─────────────────────────┘
+             │ pos_deg, vel_deg_s (filtered)
+             └──────────────► feedback → Outer PID
 ```
 
-**Initial position** — ตอนเรียก `SCurve_SetSegment()` ให้ส่ง encoder ค่าจริงเป็น `q_start` เสมอ
-ไม่ใช่ค่า hardcode เพื่อป้องกัน position jump ตอนเริ่ม segment ใหม่
-
-**ไม่มี runtime clamp** — ถ้าต้องการความปลอดภัยสูง ให้เพิ่ม clamp หลัง `SCurve_Update()`:
-
-```c
-TrajOutput_t ref = SCurve_Update(&traj);
-ref.velocity_deg_s = CLAMP(ref.velocity_deg_s, -SCURVE_V_MAX_DEG_S, SCURVE_V_MAX_DEG_S);
-ref.accel_deg_s2   = CLAMP(ref.accel_deg_s2,   -SCURVE_A_MAX_DEG_S2, SCURVE_A_MAX_DEG_S2);
-```
-
-ป้องกัน floating-point error สะสมในกรณี short move ที่ bisection ไม่ converge พอดี
-
-**ไม่มี hardware protection** — library นี้เป็น software limit เท่านั้น
-ควรมี hardware end-switch, current limit, และ watchdog แยกต่างหากในระบบจริง
+> ทุก block ทำงานใน `RobotArm_ControlTick()` ที่ถูก call จาก TIM7 ISR @ 1 kHz
 
 ---
 
-## Checklist ก่อน Deploy
+## File Structure
 
-- [ ] ตั้งค่า `SCURVE_V_MAX`, `SCURVE_A_MAX`, `SCURVE_J_MAX` ให้ไม่เกิน spec ของ motor จริง
-- [ ] ตรวจสอบ `TRAJ_DT` ตรงกับ interrupt period จริง
-- [ ] เรียก `SCurve_Update()` ใน loop เดียวกับ controller ไม่ใช่คนละ task โดยไม่ sync
-- [ ] ทดสอบ short move (เช่น 1–5 deg) ว่า bisection ทำงานถูกต้อง
-- [ ] ทดสอบ direction กลับ (เช่น 180° → 90°) ว่า sign ถูกต้อง
-- [ ] log `position_deg`, `velocity_deg_s`, `accel_deg_s2` ออกมา plot ดูรูปร่าง S-curve ก่อนต่อ motor จริง
-- [ ] เพิ่ม runtime clamp ถ้าระบบต้องการความปลอดภัยสูง
+```
+├── main.c / main.h          — Entry point, HAL init, TIM config, UART logging
+├── robot_arm.c / .h         — Library หลัก: API, Control Loop, PID, Motor driver
+├── scurve_trajectory.c / .h — S-Curve 7-phase trajectory generator
+└── kalman.c / .h            — 4-State Discrete Kalman Filter
+```
+
+---
+
+## S-Curve Trajectory
+
+เคลื่อนที่ 7 phase เพื่อจำกัด jerk (อัตราเปลี่ยน acceleration):
+
+| Phase | Jerk | คำอธิบาย |
+|---|---|---|
+| 1 | +J_max | Acceleration เพิ่ม |
+| 2 | 0 | Acceleration คงที่ (A_max) |
+| 3 | −J_max | Acceleration ลด |
+| 4 | 0 | Cruise (ความเร็วคงที่) |
+| 5 | −J_max | Deceleration เริ่ม |
+| 6 | 0 | Deceleration คงที่ |
+| 7 | +J_max | Deceleration ลด → หยุด |
+
+สำหรับระยะสั้นที่ไม่ถึง v_max จะ bisect หา v_peak ที่เหมาะสมอัตโนมัติ
+
+**พารามิเตอร์ปัจจุบัน:**
+
+```c
+#define SCURVE_V_MAX_DEG_S    350.0f   // deg/s
+#define SCURVE_A_MAX_DEG_S2   3500.0f  // deg/s²
+#define SCURVE_J_MAX_DEG_S3   1000.0f  // deg/s³
+```
+
+---
+
+## Kalman Filter
+
+State vector: `x = [θ (rad), ω (rad/s), i (A), τ_disturbance (N·m)]`
+
+- **Predict** ทุก tick ด้วย `u_volt` จาก PWM รอบก่อน
+- **Update** ด้วย encoder position (แปลงจาก deg → rad)
+- Matrix `Ad`, `Bd`, `Qd` คำนวณด้วย Van Loan's Method ที่ Ts = 0.001 s
+- State `τ_disturbance` ช่วยรับมือกับ load ที่เปลี่ยนแปลงได้
+
+---
+
+## PID Gains
+
+### Normal Zone (ระยะ > 10 deg)
+
+| Loop | Kp | Ki | Kd |
+|---|---|---|---|
+| Position (outer) | 1.0 | 0.0001 | 0.0 |
+| Velocity (inner) | 2.0 | 0.0001 | 0.0 |
+
+### Fine Zone (ระยะ ≤ 10 deg)
+
+| Loop | Kp | Ki | Kd |
+|---|---|---|---|
+| Position (outer) | 1.3 | 0.0 | 0.0 |
+| Velocity (inner) | 1.4 | 0.0 | 0.0 |
+
+เมื่อสลับ zone จะ reset integral ทั้งสอง loop เพื่อป้องกัน windup
+
+**Done threshold:** `pos_error ≤ 0.3 deg` และ `|vel| ≤ 0.5 deg/s`
+
+---
+
+## API
+
+```c
+// เริ่มต้นระบบ (เรียกครั้งเดียวใน main)
+void RobotArm_Init(RobotArm_t *arm);
+
+// สั่งเคลื่อนที่ (relative move)
+// degrees    : ระยะทาง [deg] > 0
+// direction  : +1.0f หรือ -1.0f
+void RobotArm_Move(RobotArm_t *arm, float degrees, float direction);
+
+// ตรวจสอบว่าถึงเป้าและหยุดนิ่งแล้ว
+bool RobotArm_IsDone(const RobotArm_t *arm);
+
+// หยุดทันที
+void RobotArm_Stop(RobotArm_t *arm);
+
+// Control loop body — เรียกจาก TIM7 ISR ทุก 1 ms
+void RobotArm_ControlTick(RobotArm_t *arm);
+```
+
+### ตัวอย่างการใช้งาน
+
+```c
+// ISR — ใน stm32g4xx_it.c
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM7)
+        RobotArm_ControlTick(&g_arm);
+}
+
+// สั่งหมุน 90 องศา ทิศบวก
+RobotArm_Move(&g_arm, 90.0f, +1.0f);
+
+// รอจนเสร็จ (polling)
+while (!RobotArm_IsDone(&g_arm));
+```
+
+---
+
+## UART Logging
+
+ส่งข้อมูลออก LPUART1 ที่ **115200 baud**, **100 Hz** รูปแบบ binary frame:
+
+```
+[0xAA][0xBB][pos_deg: 4B float][ref_pos_deg: 4B float][vel_deg_s: 4B float][ref_vel_deg_s: 4B float]
+ ──── header ────  ────────────────────── 16 bytes data ──────────────────────────────────────────
+```
+
+รวม 18 bytes ต่อ frame ใช้ดู real-time ผ่าน Serial plotter หรือ Python script
+
+---
+
+## Waypoints เริ่มต้น
+
+```c
+const float WAYPOINTS_DEG[6] = {10.0f, 45.0f, 60.0f, 90.0f, 180.0f, 360.0f};
+```
+
+เรียก `SCurve_RunWaypoints()` เพื่อให้วิ่งผ่านทุก waypoint ตามลำดับโดยอัตโนมัติ
+
+---
+
+## การ Build
+
+1. เปิด project ใน **STM32CubeIDE**
+2. ใส่ไฟล์ `robot_arm.c/.h`, `scurve_trajectory.c/.h`, `kalman.c/.h` เข้า project
+3. Build & Flash ผ่าน ST-Link บน NUCLEO board
+4. กดปุ่ม **B1 (PC13)** เพื่อสั่ง move ตามค่า `tar` และ `d` ที่ตั้งไว้ใน `main.c`
+
+---
+
+## License
+
+สำหรับ FRA233 Lab 4 — FIBO, KMUTT
